@@ -742,17 +742,34 @@ class EnhancedChatService:
             r'([a-zA-Z\s]+)\s+(?:jobs?|openings?|positions?|vacancies?)\s+in\s+([a-zA-Z\s]+)',
             # Pattern: "show me [skill] in [location]"
             r'(?:show|find|get|search)\s+(?:me\s+)?([a-zA-Z\s]+)\s+(?:jobs?|positions?)?\s+in\s+([a-zA-Z\s]+)',
-            # Pattern: "[location] [skill] jobs"
-            r'\b([a-zA-Z\s]+)\s+([a-zA-Z\s]+)\s+(?:jobs?|openings?|positions?)\b',
+            # Pattern: "show/find/get/give me jobs in [location]" (location only)
+            r'(?:show|find|get|give|search)\s+(?:me\s+)?(?:all\s+)?(?:jobs?|positions?|openings?|vacancies?)\s+in\s+([a-zA-Z\s]+)$',
+            # Pattern: "jobs/positions in [location]" (location only - start of message)
+            r'^(?:jobs?|positions?|openings?|vacancies?)\s+in\s+([a-zA-Z\s]+)$',
         ]
 
         # Check combined patterns first
         for pattern_idx, pattern in enumerate(combined_patterns):
             match = re.search(pattern, message, re.IGNORECASE)
             if match:
-                # Extract both parts
+                # Handle location-only patterns (indices 3 and 4)
+                if pattern_idx in [3, 4]:
+                    # These patterns only extract location
+                    part1 = match.group(1).strip()
+                    part1_clean = re.sub(r'\b(the|all|any|some)\b', '', part1, flags=re.IGNORECASE).strip()
+
+                    intent['location'] = part1_clean
+                    intent['has_location'] = True
+                    intent['query_type'] = 'location_only'
+                    logger.info(f"✓ Location-only query detected - Location: {intent['location']}")
+                    return intent
+
+                # Extract both parts for combined patterns
                 part1 = match.group(1).strip()
-                part2 = match.group(2).strip()
+                part2 = match.group(2).strip() if match.lastindex >= 2 else None
+
+                if not part2:
+                    continue
 
                 # Clean up common words
                 part1_clean = re.sub(r'\b(the|all|any|some)\b', '', part1, flags=re.IGNORECASE).strip()
@@ -792,8 +809,8 @@ class EnhancedChatService:
                 if intent['location'] or intent['skills']:
                     intent['has_location'] = bool(intent['location'])
                     intent['has_skills'] = bool(intent['skills'])
-                    intent['query_type'] = 'combined'
-                    logger.info(f"✓ Combined query detected - Location: {intent['location']}, Skills: {intent['skills']}")
+                    intent['query_type'] = 'combined' if (intent['has_location'] and intent['has_skills']) else ('location_only' if intent['has_location'] else 'skill_only')
+                    logger.info(f"✓ Query detected - Location: {intent['location']}, Skills: {intent['skills']}, Type: {intent['query_type']}")
                     return intent
 
         # If no combined pattern matched, extract separately
@@ -1101,34 +1118,69 @@ class EnhancedChatService:
         return None
     
     def _extract_skills_from_text(self, message: str) -> List[str]:
-        """Extract skills using comprehensive keyword matching"""
+        """Extract skills using comprehensive keyword matching with smart conflict resolution"""
         skills = []
         message_lower = message.lower()
-        
-        for main_skill, variations in self.skill_keywords.items():
-            for variation in variations:
-                if variation in message_lower:
-                    if main_skill == 'c++':
-                        skills.append('C++')
-                    elif main_skill == 'c#':
-                        skills.append('C#')
-                    elif main_skill == 'javascript':
-                        skills.append('JavaScript')
-                    elif main_skill == 'typescript':
-                        skills.append('TypeScript')
-                    elif main_skill == 'machine learning':
-                        skills.append('Machine Learning')
-                    elif main_skill == 'data science':
-                        skills.append('Data Science')
-                    elif main_skill == 'data entry':
-                        skills.append('Data Entry')
-                    elif main_skill == 'voice process':
-                        skills.append('Voice Process')
-                    elif main_skill == 'ui/ux':
-                        skills.append('UI/UX')
-                    else:
-                        skills.append(main_skill.title())
-                    break
+        matched_skills = set()  # Track already matched skills
+
+        # Sort skills by variation length (longest first) to avoid false positives
+        # e.g., match "javascript" before "java"
+        sorted_skills = sorted(
+            self.skill_keywords.items(),
+            key=lambda x: max(len(v) for v in x[1]),
+            reverse=True
+        )
+
+        for main_skill, variations in sorted_skills:
+            if main_skill in matched_skills:
+                continue
+
+            for variation in sorted(variations, key=len, reverse=True):  # Longest variation first
+                # Use word boundary matching for single words to avoid substring matches
+                if ' ' not in variation:  # Single word
+                    # Check with word boundaries
+                    pattern = r'\b' + re.escape(variation) + r'\b'
+                    if re.search(pattern, message_lower):
+                        # Special formatting for specific skills
+                        if main_skill == 'c++':
+                            skills.append('C++')
+                        elif main_skill == 'c#':
+                            skills.append('C#')
+                        elif main_skill == 'javascript':
+                            skills.append('JavaScript')
+                            matched_skills.add('java')  # Prevent "Java" from matching
+                        elif main_skill == 'typescript':
+                            skills.append('TypeScript')
+                        elif main_skill == 'machine learning':
+                            skills.append('Machine Learning')
+                        elif main_skill == 'data science':
+                            skills.append('Data Science')
+                        elif main_skill == 'data entry':
+                            skills.append('Data Entry')
+                        elif main_skill == 'voice process':
+                            skills.append('Voice Process')
+                        elif main_skill == 'ui/ux':
+                            skills.append('UI/UX')
+                        else:
+                            skills.append(main_skill.title())
+                        matched_skills.add(main_skill)
+                        break
+                else:  # Multi-word skill
+                    if variation in message_lower:
+                        if main_skill == 'machine learning':
+                            skills.append('Machine Learning')
+                        elif main_skill == 'data science':
+                            skills.append('Data Science')
+                        elif main_skill == 'data entry':
+                            skills.append('Data Entry')
+                        elif main_skill == 'voice process':
+                            skills.append('Voice Process')
+                        elif main_skill == 'customer service':
+                            skills.append('Customer Service')
+                        else:
+                            skills.append(main_skill.title())
+                        matched_skills.add(main_skill)
+                        break
         
         # Experience pattern matching
         experience_patterns = {
