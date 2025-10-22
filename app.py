@@ -722,42 +722,99 @@ class EnhancedChatService:
             'query_type': 'general'
         }
 
-        # Enhanced patterns to detect combined queries like "jobs in Mumbai on Data Entry"
+        # Known cities and states for better detection
+        known_locations = [
+            'mumbai', 'delhi', 'bangalore', 'bengaluru', 'chennai', 'hyderabad',
+            'pune', 'kolkata', 'ahmedabad', 'surat', 'jaipur', 'lucknow', 'kanpur',
+            'nagpur', 'indore', 'thane', 'bhopal', 'visakhapatnam', 'pimpri', 'patna',
+            'vadodara', 'ghaziabad', 'ludhiana', 'agra', 'nashik', 'faridabad', 'meerut',
+            'rajkot', 'kalyan', 'vasai', 'varanasi', 'srinagar', 'aurangabad', 'dhanbad',
+            'amritsar', 'navi mumbai', 'allahabad', 'ranchi', 'howrah', 'coimbatore',
+            'maharashtra', 'karnataka', 'tamil nadu', 'delhi', 'telangana', 'andhra pradesh',
+            'west bengal', 'gujarat', 'rajasthan', 'uttar pradesh', 'madhya pradesh'
+        ]
+
+        # Enhanced patterns to detect combined queries
         combined_patterns = [
-            # Pattern: "jobs in [location] on/for/in [skill]"
-            r'(?:jobs?|openings?|positions?)\s+in\s+([a-zA-Z\s]+)\s+(?:on|for|in|with)\s+([a-zA-Z\s]+)',
+            # Pattern: "jobs in [location] on/for [skill]"
+            r'(?:jobs?|openings?|positions?|vacancies?)\s+in\s+([a-zA-Z\s]+)\s+(?:on|for|in|with|of)\s+([a-zA-Z\s]+)',
             # Pattern: "[skill] jobs in [location]"
-            r'([a-zA-Z\s]+)\s+(?:jobs?|openings?|positions?)\s+in\s+([a-zA-Z\s]+)',
+            r'([a-zA-Z\s]+)\s+(?:jobs?|openings?|positions?|vacancies?)\s+in\s+([a-zA-Z\s]+)',
             # Pattern: "show me [skill] in [location]"
-            r'(?:show|find|get)\s+(?:me\s+)?([a-zA-Z\s]+)\s+(?:jobs?|positions?)?\s+in\s+([a-zA-Z\s]+)',
+            r'(?:show|find|get|search)\s+(?:me\s+)?([a-zA-Z\s]+)\s+(?:jobs?|positions?)?\s+in\s+([a-zA-Z\s]+)',
+            # Pattern: "show/find/get/give me jobs in [location]" (location only)
+            r'(?:show|find|get|give|search)\s+(?:me\s+)?(?:all\s+)?(?:jobs?|positions?|openings?|vacancies?)\s+in\s+([a-zA-Z\s]+)$',
+            # Pattern: "jobs/positions in [location]" (location only - start of message)
+            r'^(?:jobs?|positions?|openings?|vacancies?)\s+in\s+([a-zA-Z\s]+)$',
         ]
 
         # Check combined patterns first
-        for pattern in combined_patterns:
+        for pattern_idx, pattern in enumerate(combined_patterns):
             match = re.search(pattern, message, re.IGNORECASE)
             if match:
-                # Extract both parts
+                # Handle location-only patterns (indices 3 and 4)
+                if pattern_idx in [3, 4]:
+                    # These patterns only extract location
+                    part1 = match.group(1).strip()
+                    part1_clean = re.sub(r'\b(the|all|any|some)\b', '', part1, flags=re.IGNORECASE).strip()
+
+                    intent['location'] = part1_clean
+                    intent['has_location'] = True
+                    intent['query_type'] = 'location_only'
+                    logger.info(f"✓ Location-only query detected - Location: {intent['location']}")
+                    return intent
+
+                # Extract both parts for combined patterns
                 part1 = match.group(1).strip()
-                part2 = match.group(2).strip()
+                part2 = match.group(2).strip() if match.lastindex >= 2 else None
 
-                # Determine which is location and which is skill
-                cities = ['mumbai', 'delhi', 'bangalore', 'bengaluru', 'chennai', 'hyderabad', 'pune', 'kolkata']
-                if part1.lower() in cities or len(part1.split()) <= 2:
-                    # part1 is likely location, part2 is skill
-                    intent['location'] = part1
-                    intent['skills'] = self._extract_skills_from_text(part2)
+                if not part2:
+                    continue
+
+                # Clean up common words
+                part1_clean = re.sub(r'\b(the|all|any|some)\b', '', part1, flags=re.IGNORECASE).strip()
+                part2_clean = re.sub(r'\b(the|all|any|some)\b', '', part2, flags=re.IGNORECASE).strip()
+
+                # Smart detection: Check which part is a known location
+                part1_is_location = part1_clean.lower() in known_locations
+                part2_is_location = part2_clean.lower() in known_locations
+
+                # Check if parts contain location-related words
+                part1_has_location_words = any(loc in part1_clean.lower() for loc in known_locations)
+                part2_has_location_words = any(loc in part2_clean.lower() for loc in known_locations)
+
+                logger.info(f"Pattern {pattern_idx}: part1='{part1_clean}' (is_loc={part1_is_location}), part2='{part2_clean}' (is_loc={part2_is_location})")
+
+                # Determine location and skill based on detection
+                if part2_is_location or part2_has_location_words:
+                    # part2 is location, part1 is skill
+                    intent['location'] = part2_clean
+                    intent['skills'] = self._extract_skills_from_text(part1_clean)
+                    logger.info(f"Detected: Location={part2_clean}, Skills from '{part1_clean}'")
+                elif part1_is_location or part1_has_location_words:
+                    # part1 is location, part2 is skill
+                    intent['location'] = part1_clean
+                    intent['skills'] = self._extract_skills_from_text(part2_clean)
+                    logger.info(f"Detected: Location={part1_clean}, Skills from '{part2_clean}'")
                 else:
-                    # part1 is likely skill, part2 is location
-                    intent['skills'] = self._extract_skills_from_text(part1)
-                    intent['location'] = part2
+                    # Use pattern-specific logic
+                    if pattern_idx == 0:  # "jobs in [location] on [skill]"
+                        intent['location'] = part1_clean
+                        intent['skills'] = self._extract_skills_from_text(part2_clean)
+                    else:  # "[skill] jobs in [location]" or "show me [skill] in [location]"
+                        intent['skills'] = self._extract_skills_from_text(part1_clean)
+                        intent['location'] = part2_clean
 
-                intent['has_location'] = bool(intent['location'])
-                intent['has_skills'] = bool(intent['skills'])
-                intent['query_type'] = 'combined'
-                logger.info(f"Detected combined query - Location: {intent['location']}, Skills: {intent['skills']}")
-                return intent
+                # Validate we have both location and skills
+                if intent['location'] or intent['skills']:
+                    intent['has_location'] = bool(intent['location'])
+                    intent['has_skills'] = bool(intent['skills'])
+                    intent['query_type'] = 'combined' if (intent['has_location'] and intent['has_skills']) else ('location_only' if intent['has_location'] else 'skill_only')
+                    logger.info(f"✓ Query detected - Location: {intent['location']}, Skills: {intent['skills']}, Type: {intent['query_type']}")
+                    return intent
 
-        # If no combined pattern, extract separately
+        # If no combined pattern matched, extract separately
+        logger.info("No combined pattern matched, extracting separately")
         intent['location'] = self._extract_location_from_message(message)
         intent['skills'] = self._extract_skills_from_text(message)
         intent['job_type'] = self._extract_job_type(message)
@@ -772,31 +829,56 @@ class EnhancedChatService:
         elif intent['has_skills']:
             intent['query_type'] = 'skill_only'
 
+        logger.info(f"Separate extraction - Location: {intent['location']}, Skills: {intent['skills']}, Type: {intent['query_type']}")
         return intent
 
     def _is_location_query(self, message: str) -> bool:
-        """Detect if message is asking for location-based job search"""
+        """Detect if message is asking for location-based job search (including skill+location combos)"""
+        message_lower = message.lower()
+
+        # Comprehensive location patterns
         location_patterns = [
-            r'\b(?:jobs?|openings?|vacancies?|positions?)\s+(?:in|at|for|near)\s+\w+',
-            r'\b(?:show|find|get|give)\s+(?:me\s+)?(?:all\s+)?(?:jobs?|openings?|vacancies?)\s+(?:in|for|at)\s+\w+',
-            r'\b(?:mumbai|delhi|bangalore|bengaluru|chennai|hyderabad|pune|kolkata|ahmedabad|surat|jaipur)\s*(?:jobs?|openings?|positions?)?\b',
-            r'\ball\s+(?:the\s+)?(?:jobs?|openings?|vacancies?)\s+(?:in|for|at)\s+\w+'
+            r'\b(?:jobs?|openings?|vacancies?|positions?)\s+(?:in|at|for|near|from)\s+\w+',
+            r'\b(?:show|find|get|give|search)\s+(?:me\s+)?(?:all\s+)?(?:jobs?|openings?|vacancies?)\s+(?:in|for|at)\s+\w+',
+            r'\w+\s+(?:jobs?|openings?|positions?|vacancies?)\s+(?:in|at|for|near)\s+\w+',  # "Data Entry jobs in Mumbai"
+            r'\ball\s+(?:the\s+)?(?:jobs?|openings?|vacancies?)\s+(?:in|for|at)\s+\w+',
+            r'\b(?:jobs?|positions?)\s+(?:in|at|for)\s+[a-zA-Z\s]+\s+(?:on|for|in)\s+\w+',  # "jobs in Mumbai on Data Entry"
         ]
-        
+
         for pattern in location_patterns:
-            if re.search(pattern, message, re.IGNORECASE):
+            if re.search(pattern, message_lower, re.IGNORECASE):
+                logger.info(f"Location query detected by pattern: {pattern}")
                 return True
-        
-        location_indicators = ['in ', 'at ', 'for ', 'near ', 'around ']
-        job_keywords = ['job', 'opening', 'vacancy', 'position', 'work', 'employment', 'career', 'opportunity']
-        
-        has_location_indicator = any(indicator in message for indicator in location_indicators)
-        has_job_keyword = any(keyword in message for keyword in job_keywords)
-        
-        major_cities = ['mumbai', 'delhi', 'bangalore', 'bengaluru', 'chennai', 'hyderabad', 'pune', 'kolkata']
-        has_city_name = any(city in message for city in major_cities)
-        
-        return (has_location_indicator and has_job_keyword) or has_city_name
+
+        # Check for known locations in message
+        known_locations = [
+            'mumbai', 'delhi', 'bangalore', 'bengaluru', 'chennai', 'hyderabad',
+            'pune', 'kolkata', 'ahmedabad', 'surat', 'jaipur', 'lucknow', 'kanpur',
+            'nagpur', 'indore', 'thane', 'bhopal', 'patna', 'vadodara', 'ghaziabad',
+            'noida', 'gurgaon', 'gurugram', 'faridabad', 'coimbatore', 'kochi',
+            'visakhapatnam', 'ludhiana', 'agra', 'nashik', 'meerut', 'rajkot',
+            'maharashtra', 'karnataka', 'tamil nadu', 'telangana', 'gujarat',
+            'rajasthan', 'uttar pradesh', 'madhya pradesh', 'west bengal', 'kerala'
+        ]
+
+        # Check if message contains job keywords + location
+        job_keywords = ['job', 'jobs', 'opening', 'openings', 'vacancy', 'vacancies',
+                       'position', 'positions', 'work', 'employment', 'career', 'opportunity']
+
+        has_job_keyword = any(keyword in message_lower for keyword in job_keywords)
+        has_location = any(location in message_lower for location in known_locations)
+
+        if has_job_keyword and has_location:
+            logger.info(f"Location query detected: has job keyword and location")
+            return True
+
+        # Check for "in" + location patterns
+        location_indicators = [' in ', ' at ', ' for ', ' near ', ' from ', ' around ']
+        if has_job_keyword and any(indicator in message_lower for indicator in location_indicators):
+            logger.info(f"Location query detected: has job keyword and location indicator")
+            return True
+
+        return False
     
     async def _handle_location_job_query(self, request: ChatRequest, query_intent: Dict[str, Any] = None) -> ChatResponse:
         """Handle location-based job queries with enhanced skill detection"""
@@ -1036,34 +1118,69 @@ class EnhancedChatService:
         return None
     
     def _extract_skills_from_text(self, message: str) -> List[str]:
-        """Extract skills using comprehensive keyword matching"""
+        """Extract skills using comprehensive keyword matching with smart conflict resolution"""
         skills = []
         message_lower = message.lower()
-        
-        for main_skill, variations in self.skill_keywords.items():
-            for variation in variations:
-                if variation in message_lower:
-                    if main_skill == 'c++':
-                        skills.append('C++')
-                    elif main_skill == 'c#':
-                        skills.append('C#')
-                    elif main_skill == 'javascript':
-                        skills.append('JavaScript')
-                    elif main_skill == 'typescript':
-                        skills.append('TypeScript')
-                    elif main_skill == 'machine learning':
-                        skills.append('Machine Learning')
-                    elif main_skill == 'data science':
-                        skills.append('Data Science')
-                    elif main_skill == 'data entry':
-                        skills.append('Data Entry')
-                    elif main_skill == 'voice process':
-                        skills.append('Voice Process')
-                    elif main_skill == 'ui/ux':
-                        skills.append('UI/UX')
-                    else:
-                        skills.append(main_skill.title())
-                    break
+        matched_skills = set()  # Track already matched skills
+
+        # Sort skills by variation length (longest first) to avoid false positives
+        # e.g., match "javascript" before "java"
+        sorted_skills = sorted(
+            self.skill_keywords.items(),
+            key=lambda x: max(len(v) for v in x[1]),
+            reverse=True
+        )
+
+        for main_skill, variations in sorted_skills:
+            if main_skill in matched_skills:
+                continue
+
+            for variation in sorted(variations, key=len, reverse=True):  # Longest variation first
+                # Use word boundary matching for single words to avoid substring matches
+                if ' ' not in variation:  # Single word
+                    # Check with word boundaries
+                    pattern = r'\b' + re.escape(variation) + r'\b'
+                    if re.search(pattern, message_lower):
+                        # Special formatting for specific skills
+                        if main_skill == 'c++':
+                            skills.append('C++')
+                        elif main_skill == 'c#':
+                            skills.append('C#')
+                        elif main_skill == 'javascript':
+                            skills.append('JavaScript')
+                            matched_skills.add('java')  # Prevent "Java" from matching
+                        elif main_skill == 'typescript':
+                            skills.append('TypeScript')
+                        elif main_skill == 'machine learning':
+                            skills.append('Machine Learning')
+                        elif main_skill == 'data science':
+                            skills.append('Data Science')
+                        elif main_skill == 'data entry':
+                            skills.append('Data Entry')
+                        elif main_skill == 'voice process':
+                            skills.append('Voice Process')
+                        elif main_skill == 'ui/ux':
+                            skills.append('UI/UX')
+                        else:
+                            skills.append(main_skill.title())
+                        matched_skills.add(main_skill)
+                        break
+                else:  # Multi-word skill
+                    if variation in message_lower:
+                        if main_skill == 'machine learning':
+                            skills.append('Machine Learning')
+                        elif main_skill == 'data science':
+                            skills.append('Data Science')
+                        elif main_skill == 'data entry':
+                            skills.append('Data Entry')
+                        elif main_skill == 'voice process':
+                            skills.append('Voice Process')
+                        elif main_skill == 'customer service':
+                            skills.append('Customer Service')
+                        else:
+                            skills.append(main_skill.title())
+                        matched_skills.add(main_skill)
+                        break
         
         # Experience pattern matching
         experience_patterns = {
