@@ -483,34 +483,72 @@ class LocationJobSearchService:
                 await conn.close()
     
     async def _filter_by_skills(self, jobs: List[Dict], skills: List[str]) -> List[Dict]:
-        """Filter jobs by skills and update match percentage"""
+        """Filter jobs by skills with enhanced matching and update match percentage"""
         if not skills:
             return jobs
-        
+
         filtered_jobs = []
-        skills_lower = [skill.lower() for skill in skills]
-        
+        skills_lower = [skill.lower().strip() for skill in skills]
+
+        # Create skill variations for better matching
+        skill_variations = {}
+        for skill in skills_lower:
+            variations = [skill]
+            # Add common variations
+            if 'data entry' in skill:
+                variations.extend(['data processing', 'typing', 'data operator', 'data entry operator'])
+            elif 'python' in skill:
+                variations.extend(['python developer', 'python programming', 'django', 'flask'])
+            elif 'javascript' in skill or 'js' in skill:
+                variations.extend(['javascript developer', 'js developer', 'frontend developer'])
+            elif 'customer service' in skill:
+                variations.extend(['call center', 'voice process', 'customer support', 'telecalling'])
+
+            skill_variations[skill] = variations
+
         for job in jobs:
-            job_text = f"{job.get('title', '')} {job.get('keywords', '')} {job.get('description', '')}".lower()
-            
+            # Get job text for matching
+            job_text = f"{job.get('title', '')} {job.get('keywords', '')} {job.get('description', '')} {job.get('functionalrolename', '')}".lower()
+
             skill_matches = 0
             matched_skills = []
-            
+            partial_matches = []
+
             for skill in skills_lower:
+                # Check exact match first
                 if skill in job_text:
                     skill_matches += 1
                     matched_skills.append(skill)
-                elif any(word in job_text for word in skill.split()):
-                    skill_matches += 0.5
+                # Check skill variations
+                elif any(var in job_text for var in skill_variations.get(skill, [])):
+                    skill_matches += 0.8
                     matched_skills.append(skill)
-            
-            if skill_matches > 0:
+                # Check partial word matches
+                elif any(word in job_text for word in skill.split() if len(word) > 2):
+                    skill_matches += 0.3
+                    partial_matches.append(skill)
+
+            # More lenient filtering - include jobs with any skill match
+            if skill_matches >= 0.3:  # Lower threshold for inclusion
                 skill_match_ratio = skill_matches / len(skills)
-                job['match_percentage'] = min(95, 50 + (skill_match_ratio * 45))
-                job['skills_matched'] = matched_skills
+                # Calculate match percentage based on skill matching
+                base_score = 60 if matched_skills else 45
+                job['match_percentage'] = min(95, base_score + (skill_match_ratio * 35))
+                job['skills_matched'] = matched_skills if matched_skills else partial_matches
                 filtered_jobs.append(job)
-        
-        return filtered_jobs
+
+        # If filtering results in too few jobs, return original list with updated scores
+        if len(filtered_jobs) < 5 and len(jobs) > 0:
+            logger.info(f"Skill filtering too restrictive, returning all jobs with updated scores")
+            for job in jobs[:50]:  # Return top 50 from location search
+                job_text = f"{job.get('title', '')} {job.get('keywords', '')}".lower()
+                # Calculate a basic match score
+                matches = sum(1 for skill in skills_lower if skill in job_text)
+                job['match_percentage'] = min(75, 40 + (matches / len(skills)) * 35)
+                job['skills_matched'] = [s for s in skills_lower if s in job_text]
+            return jobs[:50]
+
+        return sorted(filtered_jobs, key=lambda x: x.get('match_percentage', 0), reverse=True)
     
     def _apply_sorting(self, jobs: List[Dict], sort_by: str) -> List[Dict]:
         """Apply sorting to job results"""
@@ -545,7 +583,9 @@ class EnhancedChatService:
     def __init__(self):
         self.location_job_service = LocationJobSearchService()
         self.location_mapper = LocationMappingService()
-        
+        self.fallback_count = {}  # Track fallback responses to prevent loops
+        self.conversation_state = {}  # Track conversation state per user
+
         # Complete skill keywords dictionary
         self.skill_keywords = {
             # Technical/IT Skills
@@ -633,24 +673,107 @@ class EnhancedChatService:
     async def handle_chat_message(self, request: ChatRequest) -> ChatResponse:
         """Main chat handler that detects location queries and routes appropriately"""
         message = request.message.lower().strip()
-        
+        user_id = id(request)  # Simple user tracking
+
         try:
-            # Detect if this is a location-based job query
+            # Reset fallback count if message has meaningful content
+            if len(message) > 3 and not message in ['okay', 'ok', 'yes', 'no']:
+                self.fallback_count[user_id] = 0
+
+            # Parse query intent - detect combined location + skill queries
+            query_intent = self._parse_query_intent(message)
+
+            # Detect if this is a location-based job query (with or without skills)
             if self._is_location_query(message):
-                return await self._handle_location_job_query(request)
+                return await self._handle_location_job_query(request, query_intent)
             else:
                 # Fall back to regular chat logic
                 return await self._handle_regular_chat(request)
-                
+
         except Exception as e:
             logger.error(f"Enhanced chat failed: {e}")
+            # Track fallback to prevent loops
+            self.fallback_count[user_id] = self.fallback_count.get(user_id, 0) + 1
+
+            if self.fallback_count.get(user_id, 0) > 2:
+                # After 2 fallbacks, provide more specific guidance
+                return ChatResponse(
+                    response="Let me help you get started! Here are some specific examples:\n\n1. 'Show me Python jobs in Mumbai'\n2. 'Data Entry positions in Delhi'\n3. 'I know Python and React'\n4. Upload your CV using the file upload option",
+                    message_type="text",
+                    chat_phase="intro",
+                    suggestions=["Python jobs in Mumbai", "Data Entry in Delhi", "Upload CV", "I know Python"]
+                )
+
             return ChatResponse(
                 response="I can help you find jobs! You can ask about specific locations like 'Jobs in Mumbai' or tell me about your skills.",
                 message_type="text",
                 chat_phase="profile_building",
                 suggestions=["Jobs in Mumbai", "My skills are...", "Remote work", "Entry level jobs"]
             )
-    
+
+    def _parse_query_intent(self, message: str) -> Dict[str, Any]:
+        """Parse user query to extract location, skills, and intent - handles combined queries"""
+        intent = {
+            'has_location': False,
+            'has_skills': False,
+            'location': None,
+            'skills': [],
+            'job_type': None,
+            'query_type': 'general'
+        }
+
+        # Enhanced patterns to detect combined queries like "jobs in Mumbai on Data Entry"
+        combined_patterns = [
+            # Pattern: "jobs in [location] on/for/in [skill]"
+            r'(?:jobs?|openings?|positions?)\s+in\s+([a-zA-Z\s]+)\s+(?:on|for|in|with)\s+([a-zA-Z\s]+)',
+            # Pattern: "[skill] jobs in [location]"
+            r'([a-zA-Z\s]+)\s+(?:jobs?|openings?|positions?)\s+in\s+([a-zA-Z\s]+)',
+            # Pattern: "show me [skill] in [location]"
+            r'(?:show|find|get)\s+(?:me\s+)?([a-zA-Z\s]+)\s+(?:jobs?|positions?)?\s+in\s+([a-zA-Z\s]+)',
+        ]
+
+        # Check combined patterns first
+        for pattern in combined_patterns:
+            match = re.search(pattern, message, re.IGNORECASE)
+            if match:
+                # Extract both parts
+                part1 = match.group(1).strip()
+                part2 = match.group(2).strip()
+
+                # Determine which is location and which is skill
+                cities = ['mumbai', 'delhi', 'bangalore', 'bengaluru', 'chennai', 'hyderabad', 'pune', 'kolkata']
+                if part1.lower() in cities or len(part1.split()) <= 2:
+                    # part1 is likely location, part2 is skill
+                    intent['location'] = part1
+                    intent['skills'] = self._extract_skills_from_text(part2)
+                else:
+                    # part1 is likely skill, part2 is location
+                    intent['skills'] = self._extract_skills_from_text(part1)
+                    intent['location'] = part2
+
+                intent['has_location'] = bool(intent['location'])
+                intent['has_skills'] = bool(intent['skills'])
+                intent['query_type'] = 'combined'
+                logger.info(f"Detected combined query - Location: {intent['location']}, Skills: {intent['skills']}")
+                return intent
+
+        # If no combined pattern, extract separately
+        intent['location'] = self._extract_location_from_message(message)
+        intent['skills'] = self._extract_skills_from_text(message)
+        intent['job_type'] = self._extract_job_type(message)
+
+        intent['has_location'] = bool(intent['location'])
+        intent['has_skills'] = bool(intent['skills'])
+
+        if intent['has_location'] and intent['has_skills']:
+            intent['query_type'] = 'location_skill'
+        elif intent['has_location']:
+            intent['query_type'] = 'location_only'
+        elif intent['has_skills']:
+            intent['query_type'] = 'skill_only'
+
+        return intent
+
     def _is_location_query(self, message: str) -> bool:
         """Detect if message is asking for location-based job search"""
         location_patterns = [
@@ -675,13 +798,23 @@ class EnhancedChatService:
         
         return (has_location_indicator and has_job_keyword) or has_city_name
     
-    async def _handle_location_job_query(self, request: ChatRequest) -> ChatResponse:
-        """Handle location-based job queries"""
+    async def _handle_location_job_query(self, request: ChatRequest, query_intent: Dict[str, Any] = None) -> ChatResponse:
+        """Handle location-based job queries with enhanced skill detection"""
         message = request.message.lower().strip()
-        
+
         try:
-            location = self._extract_location_from_message(message)
-            logger.info(f"Extracted Location: {location}")
+            # Use parsed intent if available, otherwise extract
+            if query_intent:
+                location = query_intent.get('location')
+                skills = query_intent.get('skills', [])
+                job_type = query_intent.get('job_type')
+            else:
+                location = self._extract_location_from_message(message)
+                skills = self._extract_skills_from_text(message)
+                job_type = self._extract_job_type(message)
+
+            logger.info(f"Extracted Location: {location}, Skills: {skills}, Job Type: {job_type}")
+
             if not location:
                 return ChatResponse(
                     response="I'd be happy to help you find jobs by location! Please specify a city or state. For example:\n\n• 'Jobs in Mumbai'\n• 'Show openings in Karnataka'\n• 'IT positions in Delhi'\n• 'All jobs in Bangalore'",
@@ -689,9 +822,8 @@ class EnhancedChatService:
                     chat_phase="job_searching",
                     suggestions=["Jobs in Mumbai", "IT jobs in Bangalore", "Remote positions", "Entry level jobs in Delhi"]
                 )
-            
-            skills = self._extract_skills_from_text(message)
-            job_type = self._extract_job_type(message)
+
+            # Extract additional parameters if not already in query_intent
             experience_range = self._extract_experience_range(message)
             salary_range = self._extract_salary_range(message)
             
@@ -712,10 +844,10 @@ class EnhancedChatService:
             )
             
             search_response = await self.location_job_service.search_jobs_by_location(location_request)
-            
+
             if search_response.jobs:
-                response_text = self._format_location_success_response(search_response)
-                
+                response_text = self._format_location_success_response(search_response, skills)
+
                 return ChatResponse(
                     response=response_text,
                     message_type="job_results",
@@ -750,20 +882,23 @@ class EnhancedChatService:
             )
     
     async def _handle_regular_chat(self, request: ChatRequest) -> ChatResponse:
-        """Handle regular chat using existing logic"""
+        """Handle regular chat using existing logic with improved fallback handling"""
         message = request.message.lower().strip()
         chat_phase = request.chat_phase
         user_profile = request.user_profile or {}
-        
+        user_id = id(request)
+
         try:
             if chat_phase == "intro":
                 if any(word in message for word in ["upload", "cv", "resume", "file"]):
+                    self.fallback_count[user_id] = 0  # Reset on valid interaction
                     return ChatResponse(
                         response="Great! Please click the paperclip icon to upload your CV. I support PDF, DOC, and DOCX files.",
                         message_type="text",
                         chat_phase="intro"
                     )
                 elif any(word in message for word in ["chat", "talk", "build", "skills", "hello", "hi", "hey"]):
+                    self.fallback_count[user_id] = 0  # Reset on valid interaction
                     return ChatResponse(
                         response="Perfect! Let's build your profile together. What are your main skills? (e.g., Python, React, Data Entry, Customer Service, etc.)\n\nYou can also ask about jobs in specific locations like 'Jobs in Mumbai'.",
                         message_type="text",
@@ -771,21 +906,22 @@ class EnhancedChatService:
                     )
                 else:
                     return ChatResponse(
-                        response="I can help you find jobs in multiple ways:\n\n1. 📄 Upload your CV - I'll analyze it automatically\n2. 💬 Chat with me - I'll ask about your skills\n3. 📍 Ask about specific locations - 'Jobs in Mumbai'\n\nWhich would you prefer?",
+                        response="I can help you find jobs in multiple ways:\n\n1. 📄 Upload your CV - I'll analyze it automatically\n2. 💬 Chat with me - I'll ask about your skills\n3. 📍 Ask about specific locations - 'Jobs in Mumbai'\n4. 🔍 Combined search - 'Data Entry jobs in Mumbai'\n\nWhich would you prefer?",
                         message_type="text",
                         chat_phase="intro",
-                        suggestions=["Upload CV", "Tell me your skills", "Jobs in Mumbai", "Remote work"]
+                        suggestions=["Upload CV", "Tell me your skills", "Jobs in Mumbai", "Data Entry jobs in Mumbai"]
                     )
             
             elif chat_phase == "profile_building":
                 skills = self._extract_skills_from_text(message)
-                
+
                 if skills:
+                    self.fallback_count[user_id] = 0  # Reset on valid skill extraction
                     try:
                         skills_text = " ".join(skills)
                         skills_embedding = await embedding_service.get_embedding(skills_text)
                         similar_jobs = await vector_store.search_similar_jobs(skills_embedding, top_k=20)
-                        
+
                         if similar_jobs:
                             ranked_jobs = await gpt_service.rerank_jobs(skills, similar_jobs)
                             job_ids = [job["ncspjobid"] for job in ranked_jobs[:5]]
@@ -849,6 +985,17 @@ class EnhancedChatService:
                 
         except Exception as e:
             logger.error(f"Regular chat error: {e}")
+            # Track fallback to prevent loops
+            self.fallback_count[user_id] = self.fallback_count.get(user_id, 0) + 1
+
+            if self.fallback_count.get(user_id, 0) > 2:
+                return ChatResponse(
+                    response="Let's try a different approach! Here are specific examples:\n\n• 'Show me Python jobs in Mumbai'\n• 'I have Data Entry skills'\n• 'Customer Service positions in Delhi'\n• Or upload your CV for automatic matching",
+                    message_type="text",
+                    chat_phase="intro",
+                    suggestions=["Python jobs in Mumbai", "Data Entry skills", "Upload CV", "Customer Service in Delhi"]
+                )
+
             return ChatResponse(
                 response="Let me help you find jobs. What skills do you have? Or ask me about jobs in specific locations like 'Mumbai jobs'.",
                 message_type="text",
@@ -1027,13 +1174,17 @@ class EnhancedChatService:
     # RESPONSE FORMATTING METHODS
     # =========================================================================
     
-    def _format_location_success_response(self, search_response: LocationJobResponse) -> str:
+    def _format_location_success_response(self, search_response: LocationJobResponse, skills: List[str] = None) -> str:
         """Format successful location search response"""
         location = search_response.location_searched
         total = search_response.total_found
         returned = search_response.returned_count
-        
-        response_parts = [f"🎯 Found {total} job openings in {location}!**\n"]
+
+        # Enhanced response with skill information
+        if skills:
+            response_parts = [f"🎯 Found {total} {', '.join(skills)} job openings in {location}!\n"]
+        else:
+            response_parts = [f"🎯 Found {total} job openings in {location}!\n"]
         
         if search_response.location_matches:
             locations = []
