@@ -681,7 +681,7 @@ class EnhancedChatService:
                 self.fallback_count[user_id] = 0
 
             # Parse query intent - detect combined location + skill queries
-            query_intent = self._parse_query_intent(message)
+            query_intent = await self._parse_query_intent(message)
 
             # Detect if this is a location-based job query (with or without skills)
             if self._is_location_query(message):
@@ -711,7 +711,7 @@ class EnhancedChatService:
                 suggestions=["Jobs in Mumbai", "My skills are...", "Remote work", "Entry level jobs"]
             )
 
-    def _parse_query_intent(self, message: str) -> Dict[str, Any]:
+    async def _parse_query_intent(self, message: str) -> Dict[str, Any]:
         """Parse user query to extract location, skills, and intent - handles combined queries"""
         intent = {
             'has_location': False,
@@ -721,6 +721,43 @@ class EnhancedChatService:
             'job_type': None,
             'query_type': 'general'
         }
+
+        # STEP 1: Try Azure OpenAI-based intelligent classification first
+        try:
+            logger.info("=== Using Azure OpenAI Query Classification ===")
+            classification = await query_classifier.classify_and_extract(message)
+
+            # If classification has high confidence and is not general, use it
+            if classification['confidence'] >= 0.7 and classification['query_type'] != 'general':
+                logger.info(f"✓ Using AI classification: {classification}")
+
+                # Map query_type from AI to internal format
+                ai_query_type = classification['query_type']
+                if ai_query_type == 'skill_only':
+                    intent['query_type'] = 'skill_only'
+                    intent['has_skills'] = True
+                    intent['skills'] = classification['skills']
+                elif ai_query_type == 'location_only':
+                    intent['query_type'] = 'location_only'
+                    intent['has_location'] = True
+                    intent['location'] = classification['location']
+                elif ai_query_type == 'skill_location':
+                    intent['query_type'] = 'location_skill'
+                    intent['has_skills'] = True
+                    intent['has_location'] = True
+                    intent['skills'] = classification['skills']
+                    intent['location'] = classification['location']
+
+                logger.info(f"✓ AI-based intent - Location: {intent['location']}, Skills: {intent['skills']}, Type: {intent['query_type']}")
+                return intent
+            else:
+                logger.info(f"AI classification confidence too low ({classification['confidence']}) or general query, falling back to regex")
+
+        except Exception as e:
+            logger.warning(f"AI classification failed, falling back to regex patterns: {e}")
+
+        # STEP 2: Fallback to regex-based pattern matching
+        logger.info("=== Using Regex-based Pattern Matching ===")
 
         # Known cities and states for better detection
         known_locations = [
@@ -3246,11 +3283,157 @@ Required format: [{{"ncspjobid": 123, "title": "Job Title", "match_percentage": 
                 })
             return fallback_jobs
 
+
+class QueryClassificationService:
+    """Service class for intelligent query classification using Azure OpenAI"""
+
+    @staticmethod
+    async def classify_and_extract(user_query: str) -> Dict[str, Any]:
+        """
+        Classify user query and extract skills/locations using Azure OpenAI.
+
+        Returns:
+            Dict with keys:
+            - query_type: "skill_only", "location_only", "skill_location", or "general"
+            - skills: List of extracted skills
+            - location: Extracted location string (or None)
+            - confidence: Confidence score (0-1)
+        """
+
+        if not user_query or len(user_query.strip()) < 3:
+            return {
+                'query_type': 'general',
+                'skills': [],
+                'location': None,
+                'confidence': 0.0
+            }
+
+        prompt = f"""
+You are an intelligent job search query analyzer. Analyze the user's query and extract job search intent.
+
+User Query: "{user_query}"
+
+Your task:
+1. Determine the query type:
+   - "skill_only": User is searching for jobs based on skills/technologies only
+   - "location_only": User is searching for jobs in a specific location only
+   - "skill_location": User is searching for jobs with both skills AND location
+   - "general": General conversation, greetings, or unclear intent
+
+2. Extract skills/technologies mentioned (programming languages, frameworks, tools, job roles, etc.)
+   Examples: Java, Python, React, Data Analyst, Machine Learning, etc.
+
+3. Extract location if mentioned (city, state, region)
+   Examples: Mumbai, Bangalore, Maharashtra, etc.
+
+4. Provide confidence score (0.0 to 1.0) for your classification
+
+Return ONLY valid JSON in this exact format:
+{{
+  "query_type": "skill_only" | "location_only" | "skill_location" | "general",
+  "skills": ["skill1", "skill2"],
+  "location": "location_name" or null,
+  "confidence": 0.95
+}}
+
+Examples:
+- "Hey, I am a Java Developer. Can you find any job openings for me?"
+  → {{"query_type": "skill_only", "skills": ["Java"], "location": null, "confidence": 0.95}}
+
+- "Show me jobs in Mumbai"
+  → {{"query_type": "location_only", "skills": [], "location": "Mumbai", "confidence": 0.98}}
+
+- "I need Python developer jobs in Bangalore"
+  → {{"query_type": "skill_location", "skills": ["Python"], "location": "Bangalore", "confidence": 0.97}}
+
+- "Hello, how are you?"
+  → {{"query_type": "general", "skills": [], "location": null, "confidence": 0.99}}
+"""
+
+        try:
+            logger.info(f"Classifying query with Azure GPT: {user_query[:100]}...")
+
+            response = azure_client.chat.completions.create(
+                model=gpt_deployment,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a job search query analyzer. Return ONLY valid JSON. No explanation text. No markdown."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=500
+            )
+
+            content = response.choices[0].message.content.strip()
+
+            # Clean response
+            content = re.sub(r'```json\s*', '', content)
+            content = re.sub(r'\s*```', '', content)
+            content = content.strip()
+
+            try:
+                result = json.loads(content)
+
+                # Validate result structure
+                if not isinstance(result, dict):
+                    raise ValueError("Response is not a dictionary")
+
+                # Ensure required fields exist
+                query_type = result.get('query_type', 'general')
+                skills = result.get('skills', [])
+                location = result.get('location')
+                confidence = result.get('confidence', 0.0)
+
+                # Normalize skills list
+                if not isinstance(skills, list):
+                    skills = [str(skills)] if skills else []
+
+                # Clean and validate skills
+                skills = [s.strip() for s in skills if s and str(s).strip()]
+
+                # Clean location
+                if location:
+                    location = str(location).strip()
+                    if not location or location.lower() in ['null', 'none', 'n/a']:
+                        location = None
+
+                logger.info(f"✓ Query classified - Type: {query_type}, Skills: {skills}, Location: {location}, Confidence: {confidence}")
+
+                return {
+                    'query_type': query_type,
+                    'skills': skills,
+                    'location': location,
+                    'confidence': float(confidence)
+                }
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse GPT response as JSON: {e}")
+                logger.error(f"Response content: {content}")
+                return {
+                    'query_type': 'general',
+                    'skills': [],
+                    'location': None,
+                    'confidence': 0.0
+                }
+
+        except Exception as e:
+            logger.error(f"Query classification failed: {e}")
+            return {
+                'query_type': 'general',
+                'skills': [],
+                'location': None,
+                'confidence': 0.0
+            }
+
+
 # Initialize services
 embedding_service = LocalEmbeddingService()
 vector_store = FAISSVectorStore()
 gpt_service = GPTService()
 course_service = CourseRecommendationService()
+query_classifier = QueryClassificationService()
 
 cv_processor = CVProcessor(
     model_path="all-MiniLM-L6-v2",
